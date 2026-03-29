@@ -407,15 +407,34 @@ async def get_job_info(job_id: str, job_meta: dict) -> SchedulerJobInfo:
     else:
         is_enabled = True
 
-    # Get last run info from Redis
-    task_key = f"background_tasks:run_spider:spider_name={job_id}"
+    # Get last run info from Redis.
+    # Task queue writes keys as "background_tasks:{actor_name}:{kwargs}" which may differ
+    # from the scheduler job name. Try multiple key patterns to find the timestamp.
     state_key = f"scrapy_stats:{job_id}"
+    last_run_timestamp = None
 
-    # Also check other task key patterns
-    if job_id not in const.SCRAPY_SPIDERS:
-        task_key = f"background_tasks:{job_id}"
+    if job_id in const.SCRAPY_SPIDERS:
+        last_run_timestamp = await REDIS_ASYNC_CLIENT.get(
+            f"background_tasks:run_spider:spider_name={job_id}"
+        )
+    else:
+        # Try all known key patterns for non-spider tasks
+        candidate_keys = [
+            f"background_tasks:{job_id}",
+            f"background_tasks:{job_id}:",
+            f"background_tasks:run_{job_id}:",
+        ]
+        for key in candidate_keys:
+            last_run_timestamp = await REDIS_ASYNC_CLIENT.get(key)
+            if last_run_timestamp is not None:
+                break
+        # Last resort: scan for any key containing the job_id
+        if last_run_timestamp is None:
+            async for key in REDIS_ASYNC_CLIENT.scan_iter(match=f"background_tasks:*{job_id}*", count=10):
+                last_run_timestamp = await REDIS_ASYNC_CLIENT.get(key)
+                if last_run_timestamp is not None:
+                    break
 
-    last_run_timestamp = await REDIS_ASYNC_CLIENT.get(task_key)
     last_run_state_raw = await REDIS_ASYNC_CLIENT.get(state_key)
 
     # Check if job is currently running

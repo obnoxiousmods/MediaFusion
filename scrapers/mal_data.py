@@ -118,10 +118,10 @@ async def _anilist_request(
             async with httpx.AsyncClient(proxy=settings.requests_proxy_url, timeout=30) as client:
                 response = await client.post(ANILIST_GRAPHQL_URL, json=payload, headers=headers)
 
-                if response.status_code == 429:
+                if response.status_code in (429, 403):
                     retry_after = response.headers.get("Retry-After")
                     delay = int(retry_after) if retry_after and retry_after.isdigit() else min(2 * (2**attempt), 60)
-                    logger.warning(f"AniList rate limited, retrying in {delay}s (attempt {attempt + 1}/{max_retries})")
+                    logger.warning(f"AniList rate limited (HTTP {response.status_code}), retrying in {delay}s (attempt {attempt + 1}/{max_retries})")
                     await asyncio.sleep(delay)
                     continue
 

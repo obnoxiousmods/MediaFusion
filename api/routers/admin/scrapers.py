@@ -183,9 +183,9 @@ class RunDMMHashlistFullRequest(BaseModel):
 
     sync: bool = False
     reset_checkpoints: bool = False
-    max_iterations: int = Field(default=DEFAULT_FULL_INGEST_MAX_ITERATIONS, ge=1, le=2000)
-    incremental_commits: int = Field(default=DEFAULT_FULL_INGEST_INCREMENTAL_COMMITS, ge=0, le=100)
-    backfill_commits: int = Field(default=DEFAULT_FULL_INGEST_BACKFILL_COMMITS, ge=0, le=100)
+    max_iterations: int = Field(default=DEFAULT_FULL_INGEST_MAX_ITERATIONS, ge=1, le=5000)
+    incremental_commits: int = Field(default=DEFAULT_FULL_INGEST_INCREMENTAL_COMMITS, ge=0, le=500)
+    backfill_commits: int = Field(default=DEFAULT_FULL_INGEST_BACKFILL_COMMITS, ge=0, le=500)
 
 
 # ============================================

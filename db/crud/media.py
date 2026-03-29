@@ -347,11 +347,15 @@ async def create_media(
     session.add(media)
     await session.flush()
 
-    # Add genre links
+    # Add genre links (using on_conflict_do_nothing to handle concurrent inserts)
     if genres:
         for genre in genres:
-            link = MediaGenreLink(media_id=media.id, genre_id=genre.id)
-            session.add(link)
+            stmt = (
+                pg_insert(MediaGenreLink)
+                .values(media_id=media.id, genre_id=genre.id)
+                .on_conflict_do_nothing()
+            )
+            await session.exec(stmt)
 
     # Add catalog links
     if catalogs:

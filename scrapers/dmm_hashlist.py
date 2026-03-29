@@ -53,14 +53,14 @@ LATEST_COMMIT_SHA_KEY = "dmm_hashlist_scraper:latest_commit_sha"
 BACKFILL_NEXT_COMMIT_SHA_KEY = "dmm_hashlist_scraper:backfill_next_commit_sha"
 PROCESSED_FILE_SHA_KEY = "dmm_hashlist_scraper:processed_file_shas"
 BACKFILL_DONE_SENTINEL = "__done__"
-DEFAULT_FULL_INGEST_INCREMENTAL_COMMITS = 100
-DEFAULT_FULL_INGEST_BACKFILL_COMMITS = 100
-DEFAULT_FULL_INGEST_MAX_ITERATIONS = 200
+DEFAULT_FULL_INGEST_INCREMENTAL_COMMITS = 500
+DEFAULT_FULL_INGEST_BACKFILL_COMMITS = 500
+DEFAULT_FULL_INGEST_MAX_ITERATIONS = 500
 
 # Keep title matching strict to avoid wrong cross-title links.
 DMM_METADATA_MIN_SIMILARITY = 87
 DMM_METADATA_SEARCH_TIMEOUT_SECONDS = 8
-DMM_METADATA_RESOLVE_CONCURRENCY = 8
+DMM_METADATA_RESOLVE_CONCURRENCY = 32
 
 
 def _decode_redis_value(value: bytes | str | None) -> str | None:
@@ -358,15 +358,39 @@ class DMMHashlistScraper:
                 self.max_incremental_commits,
             )
 
-        for commit_sha in reversed(commits_to_process):
-            commit_stats = await self._process_commit(commit_sha)
-            stats["commits_processed"] += 1
-            stats["files_processed"] += commit_stats["files_processed"]
-            stats["streams_created"] += commit_stats["streams_created"]
+        total_commits = len(commits_to_process)
+        logger.info("DMM incremental: %d commits to process", total_commits)
+
+        INCREMENTAL_BATCH_SIZE = 8
+        ordered_shas = list(reversed(commits_to_process))
+        phase_start = asyncio.get_event_loop().time()
+
+        for batch_start in range(0, len(ordered_shas), INCREMENTAL_BATCH_SIZE):
+            batch = ordered_shas[batch_start:batch_start + INCREMENTAL_BATCH_SIZE]
+            batch_results = await asyncio.gather(
+                *(self._process_commit(sha) for sha in batch)
+            )
+            for commit_stats in batch_results:
+                stats["commits_processed"] += 1
+                stats["files_processed"] += commit_stats["files_processed"]
+                stats["streams_created"] += commit_stats["streams_created"]
+
+            elapsed = asyncio.get_event_loop().time() - phase_start
+            rate = stats["commits_processed"] / elapsed if elapsed > 0 else 0
+            remaining = total_commits - stats["commits_processed"]
+            eta_s = remaining / rate if rate > 0 else 0
+            eta_m = int(eta_s // 60)
+            eta_sec = int(eta_s % 60)
+            logger.info(
+                "DMM [1/2 incremental] %d/%d commits (%.1f/min) files=%d streams=%d ETA=%dm%ds",
+                stats["commits_processed"], total_commits, rate * 60,
+                stats["files_processed"], stats["streams_created"], eta_m, eta_sec,
+            )
 
         if head_sha:
             await self._set_redis_str(LATEST_COMMIT_SHA_KEY, head_sha)
 
+        logger.info("DMM incremental done in %.1fs: %s", asyncio.get_event_loop().time() - phase_start, stats)
         return stats
 
     async def _process_backfill_commits(self) -> dict[str, int]:
@@ -394,15 +418,73 @@ class DMMHashlistScraper:
                 return stats
             await self._set_redis_str(BACKFILL_NEXT_COMMIT_SHA_KEY, next_commit_sha)
 
-        current_sha = next_commit_sha
-        while current_sha and stats["commits_processed"] < self.max_backfill_commits:
-            commit_stats = await self._process_commit(current_sha)
-            stats["commits_processed"] += 1
-            stats["files_processed"] += commit_stats["files_processed"]
-            stats["streams_created"] += commit_stats["streams_created"]
-            current_sha = commit_stats["next_parent_sha"]
+        logger.info("DMM backfill: starting from commit %s (max %d)", next_commit_sha[:8], self.max_backfill_commits)
 
+        # Fetch commit SHAs in batches via the list API, then process in parallel batches
+        BACKFILL_BATCH_SIZE = 8
+        current_sha = next_commit_sha
+        remaining = self.max_backfill_commits
+        phase_start = asyncio.get_event_loop().time()
+
+        while current_sha and remaining > 0:
+            page_size = min(remaining, 100)
+            try:
+                commits_page = await self._request_json(
+                    f"{GITHUB_API_BASE_URL}/repos/{self.owner}/{self.repo}/commits",
+                    params={"sha": current_sha, "per_page": page_size, "page": 1},
+                )
+            except Exception as exc:
+                logger.warning("DMM backfill: failed to fetch commit list from %s: %s", current_sha[:8], exc)
+                break
+
+            if not commits_page:
+                break
+
+            commit_shas = [c.get("sha") for c in commits_page if c.get("sha")]
+            if not commit_shas:
+                break
+
+            for batch_start in range(0, len(commit_shas), BACKFILL_BATCH_SIZE):
+                batch = commit_shas[batch_start:batch_start + BACKFILL_BATCH_SIZE]
+                batch_results = await asyncio.gather(
+                    *(self._process_commit(sha) for sha in batch)
+                )
+                for commit_stats in batch_results:
+                    stats["commits_processed"] += 1
+                    stats["files_processed"] += commit_stats["files_processed"]
+                    stats["streams_created"] += commit_stats["streams_created"]
+                    remaining -= 1
+
+                elapsed = asyncio.get_event_loop().time() - phase_start
+                rate = stats["commits_processed"] / elapsed if elapsed > 0 else 0
+                eta_s = remaining / rate if rate > 0 else 0
+                eta_m = int(eta_s // 60)
+                eta_sec = int(eta_s % 60)
+                logger.info(
+                    "DMM [2/2 backfill] %d/%d commits (%.1f/min) files=%d streams=%d ETA=%dm%ds",
+                    stats["commits_processed"], self.max_backfill_commits, rate * 60,
+                    stats["files_processed"], stats["streams_created"], eta_m, eta_sec,
+                )
+
+            # Next page starts from the last commit's parent
+            last_commit_data = commits_page[-1]
+            last_sha = last_commit_data.get("sha")
+            if last_sha == commit_shas[-1]:
+                # Fetch the actual commit to get parent
+                try:
+                    last_detail = await self._request_json(
+                        f"{GITHUB_API_BASE_URL}/repos/{self.owner}/{self.repo}/commits/{last_sha}"
+                    )
+                    parents = last_detail.get("parents", [])
+                    current_sha = parents[0].get("sha") if parents else ""
+                except Exception:
+                    current_sha = ""
+            else:
+                current_sha = ""
+
+        done = not current_sha
         await self._set_redis_str(BACKFILL_NEXT_COMMIT_SHA_KEY, current_sha or BACKFILL_DONE_SENTINEL)
+        logger.info("DMM backfill done (complete=%s): %s", done, stats)
         return stats
 
     async def _process_commit(self, commit_sha: str) -> dict[str, int | str]:
@@ -416,15 +498,29 @@ class DMMHashlistScraper:
         files_processed = 0
         streams_created = 0
 
-        for file_data in commit_data.get("files", []):
-            file_path = str(file_data.get("filename", ""))
-            if not file_path.endswith(".html"):
-                continue
+        all_files = commit_data.get("files", [])
+        html_files = [f for f in all_files if str(f.get("filename", "")).endswith(".html")]
 
+        # Filter out already-processed blobs
+        files_to_process = []
+        skipped_blobs = 0
+        for file_data in html_files:
             blob_sha = file_data.get("sha")
             if blob_sha and await REDIS_ASYNC_CLIENT.sismember(PROCESSED_FILE_SHA_KEY, blob_sha):
-                continue
+                skipped_blobs += 1
+            else:
+                files_to_process.append(file_data)
 
+        if skipped_blobs:
+            logger.info(
+                "DMM commit %s: %d/%d html files skipped (already processed), %d to process",
+                commit_sha[:8], skipped_blobs, len(html_files), len(files_to_process),
+            )
+
+        # Process files concurrently
+        async def _process_file(file_data: dict) -> tuple[int, int]:
+            file_path = str(file_data.get("filename", ""))
+            blob_sha = file_data.get("sha")
             raw_url = file_data.get("raw_url")
             if not raw_url:
                 raw_url = f"https://raw.githubusercontent.com/{self.owner}/{self.repo}/{self.branch}/{file_path}"
@@ -433,28 +529,36 @@ class DMMHashlistScraper:
                 html_content = await self._request_text(raw_url)
             except httpx.HTTPError as exc:
                 logger.warning("Failed to fetch DMM hashlist file %s: %s", file_path, exc)
-                continue
+                return 0, 0
 
             encoded_payload = extract_hash_fragment_from_html(html_content)
             if not encoded_payload:
                 logger.warning("Skipping DMM file without hash fragment: %s (html_length=%d)", file_path, len(html_content))
                 if blob_sha:
                     await REDIS_ASYNC_CLIENT.sadd(PROCESSED_FILE_SHA_KEY, blob_sha)
-                continue
+                return 0, 0
 
             try:
                 entries = decode_hashlist_payload(encoded_payload)
             except Exception as exc:
                 logger.warning("Failed to decode DMM payload for %s: %s", file_path, exc)
-                continue
+                return 0, 0
 
             created = await self._store_entries(entries, commit_date)
-            files_processed += 1
-            streams_created += created
+            logger.info(
+                "DMM commit %s file %s: %d entries decoded, %d streams stored",
+                commit_sha[:8], file_path, len(entries), created,
+            )
 
             if blob_sha:
                 await REDIS_ASYNC_CLIENT.sadd(PROCESSED_FILE_SHA_KEY, blob_sha)
+            return 1, created
 
+        if files_to_process:
+            results = await asyncio.gather(*(_process_file(f) for f in files_to_process))
+            for processed, created in results:
+                files_processed += processed
+                streams_created += created
         return {
             "files_processed": files_processed,
             "streams_created": streams_created,
@@ -629,6 +733,7 @@ class DMMHashlistScraper:
                 torrent_title=torrent_title,
             )
         if existing_meta_id:
+            logger.debug("DMM metadata DB HIT: title=%r year=%s -> %s", title, year, existing_meta_id)
             return existing_meta_id
 
         anime_search_enabled = is_likely_anime_title(torrent_title or title, media_type=media_type)
@@ -814,8 +919,8 @@ async def run_dmm_hashlist_full_ingestion(
         )
 
     scraper = DMMHashlistScraper()
-    scraper.max_incremental_commits = max(0, min(incremental_commits, 100))
-    scraper.max_backfill_commits = max(0, min(backfill_commits, 100))
+    scraper.max_incremental_commits = max(0, incremental_commits)
+    scraper.max_backfill_commits = max(0, backfill_commits)
 
     totals = {
         "incremental_commits": 0,

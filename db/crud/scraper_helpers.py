@@ -438,12 +438,16 @@ async def get_or_create_metadata(
                 )
             )
 
-    # Add genres
+    # Add genres (using on_conflict_do_nothing to handle concurrent inserts)
     if genres := metadata_data.get("genres"):
         for genre_name in genres:
             genre = await get_or_create_genre(session, genre_name)
-            link = MediaGenreLink(media_id=media.id, genre_id=genre.id)
-            session.add(link)
+            stmt = (
+                pg_insert(MediaGenreLink)
+                .values(media_id=media.id, genre_id=genre.id)
+                .on_conflict_do_nothing()
+            )
+            await session.exec(stmt)
 
     # Add catalogs
     if catalogs := metadata_data.get("catalogs"):
