@@ -236,6 +236,7 @@ class Settings(BaseSettings):
     dmm_hashlist_sync_interval_hour: int = 6
     dmm_hashlist_commits_per_run: int = 20
     dmm_hashlist_backfill_commits_per_run: int = 20
+    dmm_hashlist_github_token: str | None = None  # GitHub PAT for 5000 req/hr instead of 60
 
     # Native Public Indexers (Scrapling-backed)
     is_scrap_from_public_indexers: bool = True

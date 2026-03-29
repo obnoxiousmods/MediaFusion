@@ -737,7 +737,10 @@ class MetadataCache:
 
 class MetadataFetcher:
     def __init__(self, cache_ttl_minutes: int = 30):
-        self.config = MetadataConfig(MetadataSource(settings.metadata_primary_source))
+        self.config = MetadataConfig(
+            MetadataSource(settings.metadata_primary_source),
+            fallback_enabled=settings.imdb_cinemeta_fallback_enabled,
+        )
         self.cache = MetadataCache(ttl_seconds=cache_ttl_minutes * 60)
 
     async def get_metadata(
@@ -1216,14 +1219,16 @@ class MetadataFetcher:
                 logging.debug(f"DB search failed for '{title}': {e}")
                 return []
 
-        # Fetch from all sources in parallel (DB first, then external providers)
-        all_results = await asyncio.gather(
-            get_db_candidates(),
-            get_imdb_candidates(),
-            get_tmdb_candidates(),
-            get_tvdb_candidates(),
-            get_anime_candidates(),
-        )
+        # Fetch from configured sources in parallel (DB always included)
+        sources = self.config.get_source_order()
+        tasks = [get_db_candidates()]
+        if MetadataSource.IMDB in sources:
+            tasks.append(get_imdb_candidates())
+        if MetadataSource.TMDB in sources:
+            tasks.append(get_tmdb_candidates())
+        tasks.append(get_tvdb_candidates())
+        tasks.append(get_anime_candidates())
+        all_results = await asyncio.gather(*tasks)
 
         # Combine results with DB entries first, then deduplicate
         results = []

@@ -101,6 +101,7 @@ def decode_hashlist_payload(encoded_payload: str) -> list[HashlistTorrentEntry]:
     """Decode DMM hashlist payload and normalize torrent rows."""
     decoded_json = decompress_from_encoded_uri_component(encoded_payload)
     if not decoded_json:
+        logger.warning("DMM payload decompression returned empty result (payload length=%d)", len(encoded_payload))
         return []
 
     payload = json_loads(decoded_json)
@@ -109,11 +110,16 @@ def decode_hashlist_payload(encoded_payload: str) -> list[HashlistTorrentEntry]:
     elif isinstance(payload, list):
         torrent_rows = payload
     else:
+        logger.warning("DMM payload has unexpected type %s, expected dict or list", type(payload).__name__)
         return []
 
     entries: list[HashlistTorrentEntry] = []
+    skipped_non_dict = 0
+    skipped_missing_fields = 0
+    skipped_bad_hash = 0
     for row in torrent_rows:
         if not isinstance(row, dict):
+            skipped_non_dict += 1
             continue
 
         filename = row.get("filename")
@@ -121,8 +127,10 @@ def decode_hashlist_payload(encoded_payload: str) -> list[HashlistTorrentEntry]:
         size = row.get("bytes")
 
         if not filename or not info_hash:
+            skipped_missing_fields += 1
             continue
         if not INFO_HASH_PATTERN.fullmatch(str(info_hash)):
+            skipped_bad_hash += 1
             continue
 
         try:
@@ -136,6 +144,12 @@ def decode_hashlist_payload(encoded_payload: str) -> list[HashlistTorrentEntry]:
                 info_hash=str(info_hash).lower(),
                 size=max(size_value, 0),
             )
+        )
+
+    if skipped_non_dict or skipped_missing_fields or skipped_bad_hash:
+        logger.warning(
+            "DMM payload decode: rows=%d valid=%d skipped_non_dict=%d skipped_missing_fields=%d skipped_bad_hash=%d",
+            len(torrent_rows), len(entries), skipped_non_dict, skipped_missing_fields, skipped_bad_hash,
         )
 
     return entries
@@ -258,13 +272,19 @@ class DMMHashlistScraper:
         self.branch = settings.dmm_hashlist_branch
         self.max_incremental_commits = max(settings.dmm_hashlist_commits_per_run, 0)
         self.max_backfill_commits = max(settings.dmm_hashlist_backfill_commits_per_run, 0)
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "MediaFusion-DMMHashlistScraper/1.0",
+        }
+        if settings.dmm_hashlist_github_token:
+            headers["Authorization"] = f"Bearer {settings.dmm_hashlist_github_token}"
+            logger.info("DMM hashlist scraper using authenticated GitHub API (5000 req/hr)")
+        else:
+            logger.warning("DMM hashlist scraper using unauthenticated GitHub API (60 req/hr)")
         self.http_client = httpx.AsyncClient(
             timeout=httpx.Timeout(40.0, connect=10.0),
             follow_redirects=True,
-            headers={
-                "Accept": "application/vnd.github+json",
-                "User-Agent": "MediaFusion-DMMHashlistScraper/1.0",
-            },
+            headers=headers,
         )
 
     async def close(self):
@@ -417,7 +437,7 @@ class DMMHashlistScraper:
 
             encoded_payload = extract_hash_fragment_from_html(html_content)
             if not encoded_payload:
-                logger.debug("Skipping DMM file without hash fragment: %s", file_path)
+                logger.warning("Skipping DMM file without hash fragment: %s (html_length=%d)", file_path, len(html_content))
                 if blob_sha:
                     await REDIS_ASYNC_CLIENT.sadd(PROCESSED_FILE_SHA_KEY, blob_sha)
                 continue
@@ -499,22 +519,34 @@ class DMMHashlistScraper:
             )
             metadata_cache = dict(resolved_pairs)
 
+        skipped_no_metadata = 0
         for entry, parsed, metadata_cache_key, media_type in parsed_entry_rows:
             meta_id = metadata_cache.get(metadata_cache_key)
             if not meta_id:
+                skipped_no_metadata += 1
+                logger.debug(
+                    "DMM entry skipped (no metadata): title=%r year=%s type=%s hash=%s filename=%r",
+                    metadata_cache_key[0], metadata_cache_key[1], metadata_cache_key[2],
+                    entry.info_hash, entry.filename,
+                )
                 continue
             stream_payloads.append(self._build_torrent_stream(entry, parsed, meta_id, created_at, media_type))
 
+        meta_resolved = sum(1 for meta_id in metadata_cache.values() if meta_id)
+        meta_failed = sum(1 for meta_id in metadata_cache.values() if not meta_id)
+        summary_parts = (
+            "DMM store summary: total=%s unique=%s adult_skipped=%s sports_skipped=%s "
+            "metadata_keys=%s meta_resolved=%s meta_failed=%s "
+            "entries_skipped_no_meta=%s payloads=%s"
+        )
+        summary_args = (
+            len(entries), len(unique_entries), skipped_adult, skipped_sports,
+            len(metadata_keys), meta_resolved, meta_failed,
+            skipped_no_metadata, len(stream_payloads),
+        )
+
         if not stream_payloads:
-            logger.info(
-                "DMM store summary: total=%s unique=%s adult_skipped=%s sports_skipped=%s metadata_keys=%s resolved=%s payloads=0 stored=0",
-                len(entries),
-                len(unique_entries),
-                skipped_adult,
-                skipped_sports,
-                len(metadata_keys),
-                sum(1 for meta_id in metadata_cache.values() if meta_id),
-            )
+            logger.warning(summary_parts + " stored=0 (nothing to store)", *summary_args)
             return 0
 
         async with get_background_session() as session:
@@ -523,17 +555,12 @@ class DMMHashlistScraper:
                 [stream.model_dump(by_alias=True) for stream in stream_payloads],
             )
             await session.commit()
-            logger.info(
-                "DMM store summary: total=%s unique=%s adult_skipped=%s sports_skipped=%s metadata_keys=%s resolved=%s payloads=%s stored=%s",
-                len(entries),
-                len(unique_entries),
-                skipped_adult,
-                skipped_sports,
-                len(metadata_keys),
-                sum(1 for meta_id in metadata_cache.values() if meta_id),
-                len(stream_payloads),
-                stored_count,
-            )
+            logger.info(summary_parts + " stored=%s", *summary_args, stored_count)
+            if stored_count < len(stream_payloads):
+                logger.warning(
+                    "DMM storage gap: %d payloads submitted but only %d stored (duplicates or media-not-found)",
+                    len(stream_payloads), stored_count,
+                )
             return stored_count
 
     async def _resolve_meta_id_from_existing_db(
@@ -553,10 +580,11 @@ class DMMHashlistScraper:
                 limit=10,
             )
         except Exception as exc:
-            logger.debug("DB metadata search failed for DMM entry '%s': %s", title, exc)
+            logger.warning("DB metadata search failed for DMM entry '%s': %s: %s", title, type(exc).__name__, exc)
             return None
 
         if not db_results:
+            logger.debug("DB metadata search returned no results for DMM entry '%s' (type=%s)", title, media_type)
             return None
 
         ext_ids_batch = await get_all_external_ids_batch(session, [media.id for media in db_results])
@@ -617,10 +645,10 @@ class DMMHashlistScraper:
                 timeout=DMM_METADATA_SEARCH_TIMEOUT_SECONDS,
             )
         except TimeoutError:
-            logger.debug("Metadata search timed out for DMM entry '%s'", title)
+            logger.warning("Metadata search TIMEOUT (%ds) for DMM entry title=%r year=%s type=%s", DMM_METADATA_SEARCH_TIMEOUT_SECONDS, title, year, media_type)
             search_results = []
         except Exception as exc:
-            logger.debug("Metadata search failed for DMM entry '%s': %s", title, exc)
+            logger.warning("Metadata search FAILED for DMM entry title=%r year=%s type=%s: %s: %s", title, year, media_type, type(exc).__name__, exc)
             search_results = []
 
         for best_match in search_results:
@@ -635,6 +663,7 @@ class DMMHashlistScraper:
 
             external_id = best_match.get("imdb_id") or best_match.get("id")
             if not external_id:
+                logger.debug("DMM metadata match has no external_id: title=%r match=%r", title, best_match.get("title"))
                 continue
 
             metadata_payload: dict[str, Any] = {
@@ -659,9 +688,16 @@ class DMMHashlistScraper:
                 )
                 if metadata_result:
                     await session.commit()
-                    return await crud.get_canonical_external_id(session, metadata_result.id)
+                    canonical_id = await crud.get_canonical_external_id(session, metadata_result.id)
+                    logger.debug("DMM metadata resolved: title=%r -> %s (via %s)", title, canonical_id, external_id)
+                    return canonical_id
+                else:
+                    logger.warning("DMM get_or_create_metadata returned None for title=%r external_id=%s", title, external_id)
 
-        logger.debug("Skipping DMM entry due to no confident metadata match: %s (%s)", title, media_type)
+        logger.warning(
+            "DMM entry NO MATCH: title=%r year=%s type=%s api_candidates=%d",
+            title, year, media_type, len(search_results),
+        )
         return None
 
     def _build_torrent_stream(

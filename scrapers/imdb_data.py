@@ -391,10 +391,13 @@ async def _search_titles_with_retry(
                 )
             except Exception as err:
                 last_error = err
-                logging.debug(
-                    "IMDB search attempt %s failed (%s): %s",
+                logging.warning(
+                    "IMDB search attempt %s/%s for title=%r failed (%s): %s: %s",
                     attempt + 1,
+                    max_retries,
+                    title,
                     "with proxy" if proxy_url else "without proxy",
+                    type(err).__name__,
                     err,
                 )
 
@@ -609,9 +612,12 @@ async def search_imdb(
             return {}
 
         except Exception as e:
-            logging.debug(f"Error in attempt {attempt + 1}: {e}")
+            logging.warning(
+                "IMDB search attempt %d/%d failed for title=%r year=%s media_type=%s: %s: %s",
+                attempt + 1, max_retries, title, year, media_type, type(e).__name__, e,
+            )
             if attempt == max_retries - 1:
-                logging.warning("IMDB Search Max retries reached. Returning empty dictionary.")
+                logging.error("IMDB search exhausted all %d retries for title=%r", max_retries, title)
                 return {}
 
     return {}
@@ -888,5 +894,8 @@ async def search_multiple_imdb(
         return full_results
 
     except Exception as e:
-        logging.error(f"Error in IMDB search: {e}")
+        logging.error(
+            "Error in IMDB search for title=%r year=%s media_type=%s: %s: %s",
+            title, year, media_type, type(e).__name__, e,
+        )
         return []

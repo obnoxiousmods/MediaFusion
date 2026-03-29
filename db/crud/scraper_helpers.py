@@ -1362,11 +1362,13 @@ async def store_new_torrent_streams(
     external_ids = []
     seen_info_hashes = set()
 
+    skipped_missing = 0
     for stream_data in streams_data:
         info_hash = stream_data.get("id") or stream_data.get("info_hash")
         meta_id = stream_data.get("meta_id")
 
         if not info_hash or not meta_id:
+            skipped_missing += 1
             continue
 
         info_hash = info_hash.lower()
@@ -1378,7 +1380,11 @@ async def store_new_torrent_streams(
         external_ids.append(meta_id)
         valid_streams.append((info_hash, meta_id, stream_data))
 
+    if skipped_missing:
+        logger.warning("store_new_torrent_streams: skipped %d streams with missing info_hash or meta_id", skipped_missing)
+
     if not valid_streams:
+        logger.warning("store_new_torrent_streams: no valid streams after filtering (input=%d)", len(streams_data))
         return 0
 
     # Step 2: Batch check for existing streams
@@ -1386,6 +1392,11 @@ async def store_new_torrent_streams(
 
     # Step 3: Batch resolve external IDs to media
     media_map = await _batch_resolve_external_ids(session, external_ids)
+    logger.info(
+        "store_new_torrent_streams: input=%d valid=%d existing=%d media_resolved=%d/%d",
+        len(streams_data), len(valid_streams), len(existing_streams),
+        sum(1 for v in media_map.values() if v is not None), len(set(external_ids)),
+    )
 
     # Step 4: Collect all reference data names
     all_languages = set()
@@ -1397,15 +1408,20 @@ async def store_new_torrent_streams(
 
     streams_to_create = []
     media_latest_stream_time: dict[int, datetime] = {}
+    skipped_existing = 0
+    skipped_no_media = 0
 
     for info_hash, meta_id, stream_data in valid_streams:
         # Skip if stream already exists
         if info_hash in existing_streams:
+            skipped_existing += 1
             continue
 
         # Skip if media not found
         media = media_map.get(meta_id)
         if not media:
+            skipped_no_media += 1
+            logger.debug("store_new_torrent_streams: media not found for meta_id=%s hash=%s", meta_id, info_hash)
             continue
 
         media_ids_to_update.add(media.id)
@@ -1427,7 +1443,18 @@ async def store_new_torrent_streams(
 
         streams_to_create.append((info_hash, meta_id, stream_data, media))
 
+    if skipped_existing or skipped_no_media:
+        logger.info(
+            "store_new_torrent_streams: skipped_existing=%d skipped_no_media=%d to_create=%d",
+            skipped_existing, skipped_no_media, len(streams_to_create),
+        )
+
     if not streams_to_create:
+        logger.warning(
+            "store_new_torrent_streams: nothing to create after filtering "
+            "(valid=%d existing=%d no_media=%d)",
+            len(valid_streams), skipped_existing, skipped_no_media,
+        )
         return 0
 
     # Step 5: Batch get or create all reference data
