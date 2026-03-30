@@ -544,6 +544,10 @@ class DMMHashlistScraper:
                 logger.warning("Failed to decode DMM payload for %s: %s", file_path, exc)
                 return 0, 0
 
+            logger.info(
+                "DMM file %s: decoded %d entries (payload=%dKB), starting chunked processing...",
+                file_path, len(entries), len(encoded_payload) // 1024,
+            )
             created = await self._store_entries(entries, commit_date)
             logger.info(
                 "DMM commit %s file %s: %d entries decoded, %d streams stored",
@@ -571,9 +575,8 @@ class DMMHashlistScraper:
 
         unique_entries = deduplicate_entries_by_info_hash(entries)
 
-        metadata_keys: dict[tuple[str, int | None, str], tuple[str, int | None, str, str]] = {}
-        stream_payloads: list[TorrentStreamData] = []
-        parsed_entry_rows: list[tuple[HashlistTorrentEntry, dict[str, Any], tuple[str, int | None, str], str]] = []
+        # Parse and filter all entries first (fast, no I/O)
+        parsed_rows: list[tuple[HashlistTorrentEntry, dict[str, Any], tuple[str, int | None, str], str]] = []
         skipped_adult = 0
         skipped_sports = 0
 
@@ -581,7 +584,6 @@ class DMMHashlistScraper:
             if is_contain_18_plus_keywords(entry.filename):
                 skipped_adult += 1
                 continue
-
             parsed = PTT.parse_title(entry.filename, True)
             parsed_title = parsed.get("title") or entry.filename
             parsed_year = parsed.get("year")
@@ -589,14 +591,23 @@ class DMMHashlistScraper:
             if media_type == "movie" and is_likely_sports_broadcast_title(entry.filename):
                 skipped_sports += 1
                 continue
-
             metadata_cache_key = (parsed_title.lower(), parsed_year, media_type)
-            metadata_keys.setdefault(metadata_cache_key, (parsed_title, parsed_year, media_type, entry.filename))
-            parsed_entry_rows.append((entry, parsed, metadata_cache_key, media_type))
+            parsed_rows.append((entry, parsed, metadata_cache_key, media_type))
 
-        metadata_cache: dict[tuple[str, int | None, str], str | None] = {}
-
+        # Process in chunks so streams get stored incrementally
+        CHUNK_SIZE = 100
+        total_stored = 0
+        total_meta_resolved = 0
+        total_meta_failed = 0
+        total_skipped_no_meta = 0
+        total_filtered = len(parsed_rows)
+        logger.info(
+            "DMM file processing: %d raw -> %d unique -> %d after filters (adult=%d sports=%d), chunking into %d-entry batches",
+            len(entries), len(unique_entries), total_filtered, skipped_adult, skipped_sports, CHUNK_SIZE,
+        )
         resolve_semaphore = asyncio.Semaphore(DMM_METADATA_RESOLVE_CONCURRENCY)
+        # Shared metadata cache across chunks to avoid re-resolving same titles
+        metadata_cache: dict[tuple[str, int | None, str], str | None] = {}
 
         async def _resolve_cache_key(
             cache_key: tuple[str, int | None, str],
@@ -607,65 +618,81 @@ class DMMHashlistScraper:
         ) -> tuple[tuple[str, int | None, str], str | None]:
             async with resolve_semaphore:
                 meta_id = await self._resolve_meta_id(
-                    parsed_title,
-                    parsed_year,
-                    media_type,
-                    torrent_title=torrent_title,
+                    parsed_title, parsed_year, media_type, torrent_title=torrent_title,
                 )
                 return cache_key, meta_id
 
-        if metadata_keys:
-            resolved_pairs = await asyncio.gather(
-                *(
-                    _resolve_cache_key(cache_key, title, year, media_type, torrent_title)
-                    for cache_key, (title, year, media_type, torrent_title) in metadata_keys.items()
+        num_chunks = (len(parsed_rows) + CHUNK_SIZE - 1) // CHUNK_SIZE
+        chunk_start_time = asyncio.get_event_loop().time()
+
+        for chunk_idx in range(0, len(parsed_rows), CHUNK_SIZE):
+            chunk = parsed_rows[chunk_idx:chunk_idx + CHUNK_SIZE]
+            chunk_num = chunk_idx // CHUNK_SIZE + 1
+
+            # Collect metadata keys not yet resolved
+            chunk_keys: dict[tuple[str, int | None, str], tuple[str, int | None, str, str]] = {}
+            for entry, parsed, cache_key, media_type in chunk:
+                if cache_key not in metadata_cache:
+                    parsed_title = parsed.get("title") or entry.filename
+                    chunk_keys.setdefault(cache_key, (parsed_title, parsed.get("year"), media_type, entry.filename))
+
+            # Resolve new keys
+            if chunk_keys:
+                resolved_pairs = await asyncio.gather(
+                    *(
+                        _resolve_cache_key(ck, t, y, mt, tt)
+                        for ck, (t, y, mt, tt) in chunk_keys.items()
+                    )
                 )
+                metadata_cache.update(dict(resolved_pairs))
+
+            # Build payloads for this chunk
+            chunk_payloads = []
+            chunk_skipped = 0
+            for entry, parsed, cache_key, media_type in chunk:
+                meta_id = metadata_cache.get(cache_key)
+                if not meta_id:
+                    chunk_skipped += 1
+                    continue
+                chunk_payloads.append(self._build_torrent_stream(entry, parsed, meta_id, created_at, media_type))
+
+            # Store this chunk immediately
+            chunk_stored = 0
+            if chunk_payloads:
+                async with get_background_session() as session:
+                    chunk_stored = await crud.store_new_torrent_streams(
+                        session,
+                        [s.model_dump(by_alias=True) for s in chunk_payloads],
+                    )
+                    await session.commit()
+
+            total_stored += chunk_stored
+            chunk_resolved = sum(1 for v in chunk_keys.values() if metadata_cache.get((v[0].lower(), v[1], v[2])))
+            chunk_failed = len(chunk_keys) - chunk_resolved
+            total_meta_resolved += chunk_resolved
+            total_meta_failed += chunk_failed
+            total_skipped_no_meta += chunk_skipped
+
+            elapsed = asyncio.get_event_loop().time() - chunk_start_time
+            rate = (chunk_idx + len(chunk)) / elapsed if elapsed > 0 else 0
+            remaining = len(parsed_rows) - (chunk_idx + len(chunk))
+            eta_s = remaining / rate if rate > 0 else 0
+
+            logger.info(
+                "DMM chunk [%d/%d] entries=%d new_keys=%d resolved=%d payloads=%d stored=%d "
+                "(total: stored=%d %.1f entries/min ETA=%dm%ds)",
+                chunk_num, num_chunks, len(chunk), len(chunk_keys), chunk_resolved,
+                len(chunk_payloads), chunk_stored,
+                total_stored, rate * 60, int(eta_s // 60), int(eta_s % 60),
             )
-            metadata_cache = dict(resolved_pairs)
 
-        skipped_no_metadata = 0
-        for entry, parsed, metadata_cache_key, media_type in parsed_entry_rows:
-            meta_id = metadata_cache.get(metadata_cache_key)
-            if not meta_id:
-                skipped_no_metadata += 1
-                logger.debug(
-                    "DMM entry skipped (no metadata): title=%r year=%s type=%s hash=%s filename=%r",
-                    metadata_cache_key[0], metadata_cache_key[1], metadata_cache_key[2],
-                    entry.info_hash, entry.filename,
-                )
-                continue
-            stream_payloads.append(self._build_torrent_stream(entry, parsed, meta_id, created_at, media_type))
-
-        meta_resolved = sum(1 for meta_id in metadata_cache.values() if meta_id)
-        meta_failed = sum(1 for meta_id in metadata_cache.values() if not meta_id)
-        summary_parts = (
-            "DMM store summary: total=%s unique=%s adult_skipped=%s sports_skipped=%s "
-            "metadata_keys=%s meta_resolved=%s meta_failed=%s "
-            "entries_skipped_no_meta=%s payloads=%s"
-        )
-        summary_args = (
+        logger.info(
+            "DMM store summary: total=%d unique=%d adult_skipped=%d sports_skipped=%d "
+            "meta_resolved=%d meta_failed=%d entries_skipped_no_meta=%d stored=%d",
             len(entries), len(unique_entries), skipped_adult, skipped_sports,
-            len(metadata_keys), meta_resolved, meta_failed,
-            skipped_no_metadata, len(stream_payloads),
+            total_meta_resolved, total_meta_failed, total_skipped_no_meta, total_stored,
         )
-
-        if not stream_payloads:
-            logger.warning(summary_parts + " stored=0 (nothing to store)", *summary_args)
-            return 0
-
-        async with get_background_session() as session:
-            stored_count = await crud.store_new_torrent_streams(
-                session,
-                [stream.model_dump(by_alias=True) for stream in stream_payloads],
-            )
-            await session.commit()
-            logger.info(summary_parts + " stored=%s", *summary_args, stored_count)
-            if stored_count < len(stream_payloads):
-                logger.warning(
-                    "DMM storage gap: %d payloads submitted but only %d stored (duplicates or media-not-found)",
-                    len(stream_payloads), stored_count,
-                )
-            return stored_count
+        return total_stored
 
     async def _resolve_meta_id_from_existing_db(
         self,
